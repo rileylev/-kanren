@@ -8,6 +8,7 @@
  (ice-9 vlist)
  (ice-9 match)
  (ice-9 curried-definitions))
+(import (rnrs (6)))                     ; assert
 
 (read-set! keywords 'prefix)
 
@@ -66,6 +67,27 @@
   (if doc (set-procedure-property! op 'documentation doc))
   op)
 
+(def subs-null  vlist-null)
+(def subs-null? vlist-null?)
+(def subs-assoc vhash-assoc)
+(def subs-cons  vhash-cons)
+(def subs-merge
+  (make-operator
+   :doc "Merge substitutions"
+   :zero vlist-null
+   :op2 (lambda (x y)
+          (if (vlist-null? x)
+              y
+              (let ((h (vlist-head x)))
+                (subs-cons (car h) (cdr h) y))))))
+(mini-test
+ "merging vhashes results in a vhash containing keys from the inputs"
+ (equal?
+  (subs-assoc 'a
+              (subs-merge (subs-cons 'a 1 subs-null)
+                          (subs-cons 'b 2 subs-null)))
+  '(a . 1)))
+
 
 (define-immutable-record-type <lvar>
   (lvar% id name) lvar?
@@ -79,16 +101,19 @@
   (subs    state-subs    with-state-subs)
   (diseqs  state-diseqs  with-state-diseqs)
   (counter state-counter with-state-counter))
-(def (state :optional (subs vlist-null) (counter 0) (diseqs vlist-null))
+(def (state :optional (subs subs-null) (counter 0) (diseqs vlist-null))
   (state% subs counter diseqs))
 
 (def (walk var subs)
   "Look up the value of var in subs"
   (if-let (pair (and (lvar? var)
-                     (vhash-assoc var subs)))
+                     (subs-assoc var subs)))
           (walk (cdr pair) subs)
           var))
+(def (walk2 var old-subs new-subs)
+  (walk (walk var old-subs) new-subs))
 (def (walk* var subs)
+  "Walk everything inside a list too"
   (let ((var (walk var subs)))
     (if (pair? var)
         (cons (walk (car var) subs)
@@ -132,21 +157,25 @@
        (m+ (g (stream-car s))
            (>>= (stream-cdr s) g)))))
 
+
+(def (pre-unify u v old-subs :optional (new-subs subs-null))
+  (let ((u (walk2 u old-subs new-subs))
+        (v (walk2 v old-subs new-subs)))
+    (cond
+     ((and (lvar? u) (lvar? v) (equal? u v)) new-subs)
+     ((lvar? u) (extend-subs u v new-subs))
+     ((lvar? v) (extend-subs v u new-subs))
+     ((and (pair? u) (pair? v))
+      (and=> (pre-unify (car u) (car v) old-subs new-subs)
+             (cut pre-unify (cdr u) (cdr v) old-subs <>)))
+     (else (and (equal? u v) new-subs)))))
 (def (unify u v subs)
   "Attempts to unify u and v wrt subs.
 Returns:
   - #f if unification fails
   - the (possibly extended) substitution that results"
-  (let ((u (walk u subs))
-        (v (walk v subs)))
-    (cond
-     ((and (lvar? u) (lvar? v) (equal? u v)) subs)
-     ((lvar? u) (extend-subs u v subs))
-     ((lvar? v) (extend-subs v u subs))
-     ((and (pair? u) (pair? v))
-      (and=> (unify (car u) (car v) subs)
-             (cut unify (cdr u) (cdr v) <>)))
-     (else (and (equal? u v) subs)))))
+  (and=> (pre-unify u v subs)
+         (cut subs-merge <> subs)))
 
 ;;; TODO?: mapstack instead of vhash.
 ;;; look up in the top of the stack first. This gives
@@ -156,18 +185,18 @@ Returns:
   "Find the part of vh that precedes suffix"
   (if (equal? vh suffix) vlist-null
       (let ((h (vlist-head vh)))
-        (vhash-cons (car h) (cdr h)
+        (subs-cons (car h) (cdr h)
                     (prefix (vlist-tail vh) suffix)))))
 (mini-test
  "Prefix returns the part of the vhash vh that precedes suffix"
  (test-assert
      (equal?
-      (vhash-cons 'a 'b vlist-null)
-      (prefix (vhash-cons 'a 'b vlist-null) vlist-null)))
+      (subs-cons 'a 'b subs-null)
+      (prefix (subs-cons 'a 'b vlist-null) subs-null)))
  (test-assert
      (equal?
       (prefix (unify (lvar 0) (lvar 1) vlist-null) vlist-null)
-      (vhash-cons (lvar 0) (lvar 1) vlist-null)))
+      (subs-cons (lvar 0) (lvar 1) vlist-null)))
  (test-assert
      (equal?
       (let ((subs (unify (lvar 0) (lvar 1) vlist-null)))
@@ -177,36 +206,39 @@ Returns:
 (def (!=verify new-subs st)
   (cond
    ((not new-subs) (η st))
-   ((equal? new-subs (state-subs st)) m0)
-   (else (let ((c (prefix new-subs (state-subs st))))
-           (η (with-state-diseqs st (vlist-cons c (state-diseqs st))))))))
+   ((subs-null? new-subs) m0)
+   (else
+    (η (with-state-diseqs st
+                          (vlist-cons new-subs (state-diseqs st)))))))
 
-(def (unify* p* s)
+(def (pre-unify* p* old-subs :optional (new-subs subs-null))
   (cond
-   ((vlist-null? p*) s)
-   ((unify (car (vlist-head p*)) (cdr (vlist-head p*)) s)
-    => (cut unify* (vlist-tail p*) <>))
+   ((vlist-null? p*) old-subs)
+   ((pre-unify (car (vlist-head p*)) (cdr (vlist-head p*)) old-subs)
+    => (cut pre-unify* (vlist-tail p*) old-subs <>))
    (else #f)))
+(def (unify* p* s)
+  (and=> (pre-unify* p* s)
+         (cut subs-merge <> s)))
 
 (def (verify-diseqs constraints subs)
   (let loop ((pending constraints)
              (simplified vlist-null))
     (cond
      ((vlist-null? pending) simplified)
-     ((unify* (vlist-head pending) subs)
+     ((pre-unify* (vlist-head pending) subs)
       => (lambda (new-subs)
-           (cond
-            ((equal? subs new-subs) #f)
-            (else (let ((c (prefix new-subs subs)))
-                    (loop (vlist-tail pending)
-                          (vlist-cons c simplified)))))))
+           (if (subs-null? new-subs) #f
+               (loop (vlist-tail pending)
+                     (vlist-cons new-subs simplified)))))
      (else (loop (vlist-tail pending) simplified)))))
 
 (def (==verify new-subs st)
   (cond
    ((not new-subs) m0)
-   ((equal? (state-subs st) new-subs) (η st))
-   ((verify-diseqs (state-diseqs st) new-subs)
+   ((subs-null? new-subs) (η st))
+   ((verify-diseqs (state-diseqs st)
+                   (subs-merge new-subs (state-subs st)))
     => (lambda (d)
          (η (set-fields st
               ((state-diseqs) d)
@@ -215,10 +247,10 @@ Returns:
 
 (def ((== u v) st)
   (lazy-stream
-   (==verify (unify u v (state-subs st)) st)))
+   (==verify (pre-unify u v (state-subs st)) st)))
 (def ((!= u v) st)
   (lazy-stream
-   (!=verify (unify u v (state-subs st)) st)))
+   (!=verify (pre-unify u v (state-subs st)) st)))
 
 
 (mini-test
@@ -275,7 +307,6 @@ Returns:
 (def ((call/project var f) st)
   (f (walk var (state-subs st))))
 
-(import (rnrs (6)))                     ; assert
 (eval-when (expand load eval)
  (def (map-tree tree
                 :key
@@ -301,8 +332,7 @@ Returns:
     (cdr tail))
   (map-tree tree
             :leaf?     leaf?
-            :on-leaf   (lambda (x)
-                         (set! tail (push-tail! tail x)))
+            :on-leaf   (lambda (x) (set! tail (push-tail! tail x)))
             :make-node (const #f))
   (cdr head))
 (mini-test
