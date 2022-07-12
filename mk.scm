@@ -8,7 +8,8 @@
  (ice-9 vlist)
  (ice-9 match)
  (ice-9 curried-definitions))
-(import (rnrs (6)))                     ; assert
+(import (rnrs (6)))                    ; assert
+                                        ;
 
 (read-set! keywords 'prefix)
 
@@ -78,31 +79,42 @@
    :op2 (lambda (x y)
           (if (vlist-null? x)
               y
-              (let ((h (vlist-head x)))
-                (subs-cons (car h) (cdr h) y))))))
+              (let ((h (vlist-head x))
+                    (t (vlist-tail x)))
+                (subs-cons (car h) (cdr h)
+                           (subs-merge t y)))))))
 (mini-test
  "merging vhashes results in a vhash containing keys from the inputs"
  (equal?
-  (subs-assoc 'a
-              (subs-merge (subs-cons 'a 1 subs-null)
-                          (subs-cons 'b 2 subs-null)))
-  '(a . 1)))
+  (vlist->list
+   (subs-merge (subs-cons 'c 3
+                          (subs-cons 'a 1 subs-null))
+               (subs-cons 'b 2 subs-null)))
+  '((c . 3) (a . 1) (b . 2))))
 
+(def name-cons cons)
+(def name-null '())
+
+(def root-cons cons)
+(def root-null '())
 
 (define-immutable-record-type <lvar>
   (lvar% id name) lvar?
-  (id   lvar-id)
+  (id lvar-id)
   (name lvar-name))
-(def (lvar id :optional name)
+(def (lvar id :optional (name #f))
   (lvar% id name))
 
 (define-immutable-record-type <state>
-  (state% subs counter diseqs) state?
+  (state% subs counter diseqs names roots) state?
   (subs    state-subs    with-state-subs)
   (diseqs  state-diseqs  with-state-diseqs)
-  (counter state-counter with-state-counter))
-(def (state :optional (subs subs-null) (counter 0) (diseqs vlist-null))
-  (state% subs counter diseqs))
+  (counter state-counter with-state-counter)
+  (names   state-names   with-state-names)
+  (roots   state-roots   with-state-roots))
+(def (state :key (subs subs-null) (counter 0)
+            (diseqs vlist-null) (names name-null) (roots root-null))
+  (state% subs counter diseqs names roots))
 
 (def (walk var subs)
   "Look up the value of var in subs"
@@ -141,14 +153,13 @@
 (def m0? stream-null?)
 (def m+
   (make-operator
-   :op2
-   (lambda (s0 s1)
-     (lazy-stream
-      (if (stream-null? s0) s1
-          (stream-cons (stream-car s0)
-                       (m+ s1 (stream-cdr s0))))))
+   :doc  "The addition for the stream monad. Interleaves the incoming streams."
    :zero m0
-   :doc "The addition for the stream monad. Interleaves the incoming streams."))
+   :op2  (lambda (s0 s1)
+           (lazy-stream
+            (if (stream-null? s0) s1
+                (stream-cons (stream-car s0)
+                             (m+ s1 (stream-cdr s0))))))))
 
 (def (>>= s g)
   "Bind for the stream monad."
@@ -156,7 +167,6 @@
    (if (stream-null? s) m0
        (m+ (g (stream-car s))
            (>>= (stream-cdr s) g)))))
-
 
 (def (pre-unify u v old-subs :optional (new-subs subs-null))
   (let ((u (walk2 u old-subs new-subs))
@@ -177,16 +187,12 @@ Returns:
   (and=> (pre-unify u v subs)
          (cut subs-merge <> subs)))
 
-;;; TODO?: mapstack instead of vhash.
-;;; look up in the top of the stack first. This gives
-;;; some ordering on top of a fully unordered map
-;;; obviates the need for prefix
 (def (prefix vh suffix)
   "Find the part of vh that precedes suffix"
   (if (equal? vh suffix) vlist-null
       (let ((h (vlist-head vh)))
         (subs-cons (car h) (cdr h)
-                    (prefix (vlist-tail vh) suffix)))))
+                   (prefix (vlist-tail vh) suffix)))))
 (mini-test
  "Prefix returns the part of the vhash vh that precedes suffix"
  (test-assert
@@ -195,12 +201,12 @@ Returns:
       (prefix (subs-cons 'a 'b vlist-null) subs-null)))
  (test-assert
      (equal?
-      (prefix (unify (lvar 0) (lvar 1) vlist-null) vlist-null)
+      (pre-unify (lvar 0) (lvar 1) vlist-null)
       (subs-cons (lvar 0) (lvar 1) vlist-null)))
  (test-assert
      (equal?
       (let ((subs (unify (lvar 0) (lvar 1) vlist-null)))
-        (prefix (unify (lvar 2) (lvar 3) subs) subs))
+        (pre-unify (lvar 2) (lvar 3) subs))
       (unify (lvar 2) (lvar 3) vlist-null))))
 
 (def (!=verify new-subs st)
@@ -212,11 +218,10 @@ Returns:
                           (vlist-cons new-subs (state-diseqs st)))))))
 
 (def (pre-unify* p* old-subs :optional (new-subs subs-null))
-  (cond
-   ((vlist-null? p*) old-subs)
-   ((pre-unify (car (vlist-head p*)) (cdr (vlist-head p*)) old-subs)
-    => (cut pre-unify* (vlist-tail p*) old-subs <>))
-   (else #f)))
+  (if (vlist-null? p*)
+      old-subs
+      (and=> (pre-unify (car (vlist-head p*)) (cdr (vlist-head p*)) old-subs)
+             (cut pre-unify* (vlist-tail p*) old-subs <>))))
 (def (unify* p* s)
   (and=> (pre-unify* p* s)
          (cut subs-merge <> s)))
@@ -242,7 +247,8 @@ Returns:
     => (lambda (d)
          (η (set-fields st
               ((state-diseqs) d)
-              ((state-subs) new-subs)))))
+              ((state-subs) (subs-merge new-subs
+                                        (state-subs st)))))))
    (else m0)))
 
 (def ((== u v) st)
@@ -265,21 +271,32 @@ Returns:
                                     ((== (lvar 0) (lvar 1)) (state)))))
            (cons (lvar 0) (lvar 1)))))
 
-(def ((call/fresh f :optional name) st)
-  (let ((ctr (state-counter st)))
-    ((f (lvar ctr name))
-     (with-state-counter st (1+ ctr)))))
+(def (pop-root st)
+  (with-state-roots st (cdr (state-roots st))))
+(def ((call/fresh f :optional (name #f)) st)
+  (stream-map
+   pop-root
+   (let ((ctr   (state-counter st))
+         (names (state-names st))
+         (roots (state-roots st)))
+     ((f (lvar ctr name))
+      (set-fields st
+        ((state-roots)   (root-cons ctr roots))
+        ((state-counter) (1+ ctr))
+        ((state-names)   (name-cons name names)))))))
 
 (def (fail st) m0)
 (def (succeed st) (η st))
 
 (def disj
   (make-operator
+   :doc "Disjunctive goal (logical or)"
    :op2 (λs ((g1 g2) st)
           (m+ (g1 st) (g2 st)))
    :zero fail))
 (def conj
   (make-operator
+   :doc "Conjunctive goal (logical and)"
    :op2 (λs ((g1 g2) st)
           (>>= (g1 st) g2))
    :zero succeed))
@@ -294,6 +311,7 @@ Returns:
      (state)))))
 
 
+
 ;; non relational μ style?
 (def ((lif testg theng :optional (elseg fail)) st)
   (cond
@@ -350,13 +368,11 @@ Returns:
                                (eq? (car x) :guard)))
              '((:guard a) b (:guard c)))))
 (def (ground? var subs)
-  (any lvar? (flatten (walk* var subs))))
+  (not (any lvar? (flatten (walk* var subs)))))
 
 
 
-(define-syntax-rule (zzz g)
-  (lambda (st)
-    (g st)))
+(define-syntax-rule (zzz g) (lambda (st) (g st)))
 
 (define-syntax-rule (conde (g ...) ...)
   (disj (zzz (conj (zzz g) ...)) ...))
@@ -368,27 +384,8 @@ Returns:
      (call/fresh (lambda (v)
                    (fresh (vs ...)
                      body ...))
-                 (symbol->string 'v)))))
+                 'v))))
 
-(comment
- (vlist-head
-  (state-subs
-   (stream-ca
-    ((fresh (out)
-       (appendo '(a) out '(a b c)))
-     (state)))))
-
- (stream-car
-  ((fresh (out)
-     (appendo '(a) '(b) out))
-   (state)))
-
- (walk (lvar 0 'out)
-       (state-subs
-        (stream-car
-         ((fresh (out)
-            (appendo '(a) out '(a b c)))
-          (state))))))
 
 
 (eval-when (expand load eval)
@@ -399,8 +396,8 @@ Returns:
       (_       stx)))
   (def (unquote? x)
     (let ((x (syntax->datum x)))
-     (and (pair? x)
-          (eq? (car x) 'unquote))))
+      (and (pair? x)
+           (eq? (car x) 'unquote))))
   (def ununquote cadr)
   (def (gentemp)
     (datum->syntax #f (gensym "_")))
@@ -420,7 +417,7 @@ Returns:
        (else
         (if (symbol? (syntax->datum x))
             (push-fresh! x))
-          x)))
+        x)))
     (def unify-list (map-tree pat
                               :kids      peel-stx
                               :leaf?     unquote?
@@ -430,9 +427,11 @@ Returns:
     (values (reverse! freshes) unify-list)))
 
 (parse-pattern #'here #'(a b))
+(parse-pattern #'here #'(_ _))
 (parse-pattern #'here #'(a ,b))
 (parse-pattern #'here #'())
 
+(parse-pattern #'here #'[(a d (a . d))])
 
 
 (define-syntax-case (matche-case against (pat body ...))
@@ -494,6 +493,35 @@ Returns:
   (fresh (rev-X)
     (reverseo X rev-X)
     (reverse-appendo rev-X Y Z)))
+
+(comment
+ (vlist->list
+  (state-subs
+   (stream-car
+    ((fresh (q)
+       (appendo '(1) '(2 3) q))
+     (state))))))
+
+(comment
+ (vlist->list
+  (state-subs
+   (stream-car
+    ((fresh (out)
+       (appendo '(a) out '(a b c)))
+     (state)))))
+
+ (stream-car
+  ((fresh (out)
+     (appendo '(a) '(b) out))
+   (state)))
+
+ (walk (lvar 0 'out)
+       (state-subs
+        (stream-car
+         ((fresh (out)
+            (appendo '(a) out '(a b c)))
+          (state))))))
+
 
 
 ;;; TODO: mukanren with work/time slices in m+ via generators
