@@ -308,22 +308,24 @@ Returns:
   (f (walk var (state-subs st))))
 
 (eval-when (expand load eval)
- (def (map-tree tree
-                :key
-                (leaf?     (const #f))
-                (on-leaf   identity)
-                (nil       '())
-                (make-node cons))
-   (let ((leaf? (lambda (x)
-                  (or (not (pair? x))
-                      (leaf? x)))))
-     (let loop ((tree tree))
-       (cond
-        ((null? tree) nil)
-        ((leaf? tree) (on-leaf tree))
-        (else (assert (pair? tree))
-         (make-node (loop (car tree))
-                    (loop (cdr tree)))))))))
+  (def (map-tree tree
+                 :key
+                 (leaf?     (const #f))
+                 (kids      identity)
+                 (on-leaf   identity)
+                 (nil       '())
+                 (make-node cons))
+    (let ((leaf? (lambda (x)
+                   (or (not (pair? x))
+                       (leaf? x)))))
+      (let loop ((tree tree))
+        (let ((tree (kids tree)))
+          (cond
+           ((null? tree) nil)
+           ((leaf? tree) (on-leaf tree))
+           (else ;; (assert (pair? tree))
+            (make-node (loop (car tree))
+                       (loop (cdr tree))))))))))
 (def (flatten tree :key (leaf? (const #f)))
   (def head (cons #f '()))
   (def tail head)
@@ -390,12 +392,18 @@ Returns:
 
 
 (eval-when (expand load eval)
+  (def (peel-stx stx)
+    (syntax-case stx ()
+      ((x . y) (cons #'x (peel-stx #'y)))
+      (()      '())
+      (_       stx)))
   (def (unquote? x)
-    (and (pair? x)
-         (eq? (car x) 'unquote)))
+    (let ((x (syntax->datum x)))
+     (and (pair? x)
+          (eq? (car x) 'unquote))))
   (def ununquote cadr)
   (def (gentemp)
-    (car (generate-temporaries '(a))))
+    (datum->syntax #f (gensym "_")))
   (def (wildcard-pat? stx)
     (eq? (syntax->datum stx) '_))
   (def (parse-pattern here pat)
@@ -408,12 +416,13 @@ Returns:
         (let ((wild (gentemp)))
           (push-fresh! wild)
           wild))
-       ((unquote? x) (datum->syntax here (ununquote x)))
+       ((unquote? x) (ununquote x))
        (else
-        (let ((stx (datum->syntax here x)))
-          (if (symbol? x) (push-fresh! stx))
-          stx))))
-    (def unify-list (map-tree (syntax->datum pat)
+        (if (symbol? (syntax->datum x))
+            (push-fresh! x))
+          x)))
+    (def unify-list (map-tree pat
+                              :kids      peel-stx
                               :leaf?     unquote?
                               :on-leaf   visitor
                               :nil       #''()
@@ -466,11 +475,11 @@ Returns:
    (!= x y)
    (membero x ys z)])
 (defne member?o
-  [(_ () #f)]
+  [(_ ()      #f)]
   [(x (x . _) #t)]
-  [(x (y . ys) flag)]
-  (!= x y)
-  (member?o x ys flag))
+  [(x (y . ys) flag)
+   (!= x y)
+   (member?o x ys flag)])
 (defne never-membero
   [(_ ())]
   [(x (y . ys))
@@ -479,7 +488,7 @@ Returns:
 (defne reverse-appendo
   [((x . xs) y zs) (reverse-appendo xs (cons x y) zs)]
   [(()       y y )])
-(def (reverso X Y)
+(def (reverseo X Y)
   (reverse-appendo X '() Y))
 (def (appendo2 X Y Z)
   (fresh (rev-X)
